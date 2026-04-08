@@ -24,6 +24,20 @@ public interface MediaWatchSessionRepository extends JpaRepository<MediaWatchSes
         OffsetDateTime getWatchedAt();
     }
 
+    interface PeakUsageHourRow {
+        Integer getHourValue();
+        Long getActiveUsers();
+        Long getTotalWatchTime();
+        Long getSessionCount();
+    }
+
+    interface UsageAggregateRow {
+        String getGroupLabel();
+        Long getActiveUsers();
+        Long getTotalWatchTime();
+        Long getSessionCount();
+    }
+
     List<MediaWatchSession> findByTenantId(Long tenantId);
 
     @Query(value = """
@@ -137,4 +151,151 @@ public interface MediaWatchSessionRepository extends JpaRepository<MediaWatchSes
     List<MediaWatchSession> findByTenantIdAndInterfaceType(Long tenantId, InterfaceType interfaceType);
 
     List<MediaWatchSession> findByTenantIdAndDeviceTypeAndInterfaceType(Long tenantId, DeviceType deviceType, InterfaceType interfaceType);
+
+    @Query(value = """
+            SELECT
+                HOUR(mws.watchedAt) AS hourValue,
+                COUNT(DISTINCT mws.userId) AS activeUsers,
+                COALESCE(SUM(COALESCE(mws.watchTime, 0)), 0) AS totalWatchTime,
+                COUNT(*) AS sessionCount
+            FROM media_watch_session mws
+            WHERE mws.tenantId = :tenantId
+              AND mws.watchedAt >= :start
+              AND mws.watchedAt <= :end
+              AND mws.userId IS NOT NULL
+              AND EXISTS (
+                    SELECT 1
+                    FROM media_watch_session au
+                    WHERE au.tenantId = mws.tenantId
+                      AND au.userId = mws.userId
+                      AND au.userId IS NOT NULL
+                      AND au.watchedAt >= :activeSince
+                      AND au.watchedAt <= :activeUntil
+                )
+            GROUP BY HOUR(mws.watchedAt)
+            ORDER BY activeUsers DESC, totalWatchTime DESC, hourValue ASC
+            """, nativeQuery = true)
+    List<PeakUsageHourRow> findPeakUsageHoursForActiveUsers(
+            @Param("tenantId") Long tenantId,
+            @Param("start") OffsetDateTime start,
+            @Param("end") OffsetDateTime end,
+            @Param("activeSince") OffsetDateTime activeSince,
+            @Param("activeUntil") OffsetDateTime activeUntil);
+
+    @Query(value = """
+            SELECT
+                HOUR(mws.watchedAt) AS hourValue,
+                COUNT(DISTINCT mws.userId) AS activeUsers,
+                COALESCE(SUM(COALESCE(mws.watchTime, 0)), 0) AS totalWatchTime,
+                COUNT(*) AS sessionCount
+            FROM media_watch_session mws
+            WHERE mws.tenantId = :tenantId
+              AND mws.watchedAt >= :start
+              AND mws.watchedAt <= :end
+              AND mws.userId IS NOT NULL
+            GROUP BY HOUR(mws.watchedAt)
+            ORDER BY activeUsers DESC, totalWatchTime DESC, hourValue ASC
+            """, nativeQuery = true)
+    List<PeakUsageHourRow> findPeakUsageHoursBasic(
+            @Param("tenantId") Long tenantId,
+            @Param("start") OffsetDateTime start,
+            @Param("end") OffsetDateTime end);
+
+    @Query(value = """
+            SELECT
+                COALESCE(mws.deviceType, 'UNKNOWN') AS groupLabel,
+                COUNT(DISTINCT mws.userId) AS activeUsers,
+                COALESCE(SUM(COALESCE(mws.watchTime, 0)), 0) AS totalWatchTime,
+                COUNT(*) AS sessionCount
+            FROM media_watch_session mws
+            WHERE mws.tenantId = :tenantId
+              AND mws.watchedAt >= :start
+              AND mws.watchedAt <= :end
+              AND mws.userId IS NOT NULL
+              AND EXISTS (
+                    SELECT 1
+                    FROM media_watch_session au
+                    WHERE au.tenantId = mws.tenantId
+                      AND au.userId = mws.userId
+                      AND au.userId IS NOT NULL
+                      AND au.watchedAt >= :activeSince
+                      AND au.watchedAt <= :activeUntil
+                )
+            GROUP BY COALESCE(mws.deviceType, 'UNKNOWN')
+            ORDER BY activeUsers DESC, totalWatchTime DESC, groupLabel ASC
+            """, nativeQuery = true)
+    List<UsageAggregateRow> aggregateDeviceUsageForActiveUsers(
+            @Param("tenantId") Long tenantId,
+            @Param("start") OffsetDateTime start,
+            @Param("end") OffsetDateTime end,
+            @Param("activeSince") OffsetDateTime activeSince,
+            @Param("activeUntil") OffsetDateTime activeUntil);
+
+    @Query(value = """
+            SELECT
+                COALESCE(mws.deviceType, 'UNKNOWN') AS groupLabel,
+                COUNT(DISTINCT mws.userId) AS activeUsers,
+                COALESCE(SUM(COALESCE(mws.watchTime, 0)), 0) AS totalWatchTime,
+                COUNT(*) AS sessionCount
+            FROM media_watch_session mws
+            WHERE mws.tenantId = :tenantId
+              AND mws.watchedAt >= :start
+              AND mws.watchedAt <= :end
+              AND mws.userId IS NOT NULL
+            GROUP BY COALESCE(mws.deviceType, 'UNKNOWN')
+            ORDER BY activeUsers DESC, totalWatchTime DESC, groupLabel ASC
+            """, nativeQuery = true)
+    List<UsageAggregateRow> aggregateDeviceUsageBasic(
+            @Param("tenantId") Long tenantId,
+            @Param("start") OffsetDateTime start,
+            @Param("end") OffsetDateTime end);
+
+    @Query(value = """
+            SELECT
+                COALESCE(mws.interfaceType, 'UNKNOWN') AS groupLabel,
+                COUNT(DISTINCT mws.userId) AS activeUsers,
+                COALESCE(SUM(COALESCE(mws.watchTime, 0)), 0) AS totalWatchTime,
+                COUNT(*) AS sessionCount
+            FROM media_watch_session mws
+            WHERE mws.tenantId = :tenantId
+              AND mws.watchedAt >= :start
+              AND mws.watchedAt <= :end
+              AND mws.userId IS NOT NULL
+              AND EXISTS (
+                    SELECT 1
+                    FROM media_watch_session au
+                    WHERE au.tenantId = mws.tenantId
+                      AND au.userId = mws.userId
+                      AND au.userId IS NOT NULL
+                      AND au.watchedAt >= :activeSince
+                      AND au.watchedAt <= :activeUntil
+                )
+            GROUP BY COALESCE(mws.interfaceType, 'UNKNOWN')
+            ORDER BY activeUsers DESC, totalWatchTime DESC, groupLabel ASC
+            """, nativeQuery = true)
+    List<UsageAggregateRow> aggregatePlatformUsageForActiveUsers(
+            @Param("tenantId") Long tenantId,
+            @Param("start") OffsetDateTime start,
+            @Param("end") OffsetDateTime end,
+            @Param("activeSince") OffsetDateTime activeSince,
+            @Param("activeUntil") OffsetDateTime activeUntil);
+
+    @Query(value = """
+            SELECT
+                COALESCE(mws.interfaceType, 'UNKNOWN') AS groupLabel,
+                COUNT(DISTINCT mws.userId) AS activeUsers,
+                COALESCE(SUM(COALESCE(mws.watchTime, 0)), 0) AS totalWatchTime,
+                COUNT(*) AS sessionCount
+            FROM media_watch_session mws
+            WHERE mws.tenantId = :tenantId
+              AND mws.watchedAt >= :start
+              AND mws.watchedAt <= :end
+              AND mws.userId IS NOT NULL
+            GROUP BY COALESCE(mws.interfaceType, 'UNKNOWN')
+            ORDER BY activeUsers DESC, totalWatchTime DESC, groupLabel ASC
+            """, nativeQuery = true)
+    List<UsageAggregateRow> aggregatePlatformUsageBasic(
+            @Param("tenantId") Long tenantId,
+            @Param("start") OffsetDateTime start,
+            @Param("end") OffsetDateTime end);
 }

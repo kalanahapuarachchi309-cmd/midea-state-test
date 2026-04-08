@@ -175,6 +175,33 @@ public class MediaWatchSessionController {
                 return RESTRICTED_TENANT_ID.equals(tenantId);
         }
 
+        @Operation(summary = "Daily Active Users (DAU)", description = "Returns daily active users for a tenant within a specified date range.")
+        @GetMapping("/dau")
+        public List<DauResDTO> getDailyActiveUsers(
+                        @Parameter(description = "Tenant ID", in = ParameterIn.HEADER, name = TENANT_HEADER) @RequestHeader(TENANT_HEADER) Long tenantId,
+                        @Parameter(description = "Start date (yyyy-MM-dd)") @RequestParam @DateTimeFormat(pattern = "yyyy-MM-dd") Date startDate,
+                        @Parameter(description = "End date (yyyy-MM-dd)") @RequestParam @DateTimeFormat(pattern = "yyyy-MM-dd") Date endDate) {
+                return mediaWatchSessionService.getDailyActiveUsers(tenantId, startDate.toInstant(), endDate.toInstant());
+        }
+
+        @Operation(summary = "Peak Usage Hours", description = "Returns hourly usage summary (active users, watch time, session count) for active users.")
+        @GetMapping("/peak-usage-hours")
+        public List<PeakUsageHourResDTO> getPeakUsageHours(
+                        @Parameter(description = "Tenant ID", in = ParameterIn.HEADER, name = TENANT_HEADER) @RequestHeader(TENANT_HEADER) Long tenantId,
+                        @Parameter(description = "Start date (yyyy-MM-dd)") @RequestParam @DateTimeFormat(pattern = "yyyy-MM-dd") Date startDate,
+                        @Parameter(description = "End date (yyyy-MM-dd)") @RequestParam @DateTimeFormat(pattern = "yyyy-MM-dd") Date endDate) {
+                return mediaWatchSessionService.getPeakUsageHours(tenantId, startDate.toInstant(), endDate.toInstant());
+        }
+
+        @Operation(summary = "Device and Platform Usage", description = "Returns device-wise and platform-wise usage summary for active users.")
+        @GetMapping("/device-platform-usage")
+        public DevicePlatformUsageResDTO getDevicePlatformUsage(
+                        @Parameter(description = "Tenant ID", in = ParameterIn.HEADER, name = TENANT_HEADER) @RequestHeader(TENANT_HEADER) Long tenantId,
+                        @Parameter(description = "Start date (yyyy-MM-dd)") @RequestParam @DateTimeFormat(pattern = "yyyy-MM-dd") Date startDate,
+                        @Parameter(description = "End date (yyyy-MM-dd)") @RequestParam @DateTimeFormat(pattern = "yyyy-MM-dd") Date endDate) {
+                return mediaWatchSessionService.getDevicePlatformUsage(tenantId, startDate.toInstant(), endDate.toInstant());
+        }
+
         @Operation(summary = "Month-wise Stats", description = "Fetches month-wise statistics for a specific media type within a provided date range.")
         @GetMapping("/monthWiseStats")
         public List<MonthWiseStatsDTO> getMonthWiseStats(

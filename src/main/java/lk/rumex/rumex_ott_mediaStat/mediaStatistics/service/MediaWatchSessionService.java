@@ -27,6 +27,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
+import org.springframework.data.redis.RedisConnectionFailureException;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -85,6 +86,14 @@ public class MediaWatchSessionService {
     @Value("${concurrency.stream-limit.active-window-seconds:70}")
     private long activeWindowSeconds;
 
+    @Value("${analytics.active-user.window-minutes:10}")
+    private long activeUserWindowMinutes;
+
+    @Value("${redis.fail-open.cooldown-seconds:120}")
+    private long redisFailOpenCooldownSeconds;
+
+    private volatile Instant redisUnavailableUntil = Instant.EPOCH;
+
     private OffsetDateTime toOffsetDateTime(Instant instant) {
         return instant.atZone(SRI_LANKA_ZONE).toOffsetDateTime();
     }
@@ -107,6 +116,76 @@ public class MediaWatchSessionService {
         session.setWatchedAt(OffsetDateTime.now(SRI_LANKA_ZONE));
         redisTemplate.opsForZSet().add(activeSessionKey(dto.getTenantId()), session, sessionScore(session));
         evictAllMediaStats();
+    }
+
+    public List<PeakUsageHourResDTO> getPeakUsageHours(Long tenantId, Instant start, Instant end) {
+        if (tenantId == null || start == null || end == null || end.isBefore(start)) {
+            return List.of();
+        }
+
+        OffsetDateTime startDateTime = toOffsetDateTime(start);
+        OffsetDateTime endDateTime = toOffsetDateTime(end);
+        OffsetDateTime now = OffsetDateTime.now(SRI_LANKA_ZONE);
+        OffsetDateTime activeSince = now.minusMinutes(activeUserWindowMinutes);
+        OffsetDateTime activeWindowBucket = activeSince.truncatedTo(ChronoUnit.MINUTES);
+
+        String key = buildMediaStatsKey("peakUsageActive", tenantId, startDateTime, endDateTime, activeWindowBucket);
+        return getOrCacheMediaStatsList(key, () -> {
+            try {
+                return mapPeakUsageRows(sessionRepo.findPeakUsageHoursForActiveUsers(
+                        tenantId, startDateTime, endDateTime, activeSince, now));
+            } catch (Exception ex) {
+                log.warn("Active-user peak usage query failed for tenant {}. Falling back to basic aggregate query. cause={}",
+                        tenantId, ex.getMessage());
+                return mapPeakUsageRows(sessionRepo.findPeakUsageHoursBasic(tenantId, startDateTime, endDateTime));
+            }
+        });
+    }
+
+    public DevicePlatformUsageResDTO getDevicePlatformUsage(Long tenantId, Instant start, Instant end) {
+        if (tenantId == null || start == null || end == null || end.isBefore(start)) {
+            return new DevicePlatformUsageResDTO(tenantId, List.of(), List.of());
+        }
+
+        OffsetDateTime startDateTime = toOffsetDateTime(start);
+        OffsetDateTime endDateTime = toOffsetDateTime(end);
+        OffsetDateTime now = OffsetDateTime.now(SRI_LANKA_ZONE);
+        OffsetDateTime activeSince = now.minusMinutes(activeUserWindowMinutes);
+        OffsetDateTime activeWindowBucket = activeSince.truncatedTo(ChronoUnit.MINUTES);
+
+        String key = buildMediaStatsKey("devicePlatformUsageActive", tenantId, startDateTime, endDateTime, activeWindowBucket);
+        return getOrCacheMediaStats(key, DevicePlatformUsageResDTO.class, () -> {
+            try {
+                List<DeviceUsageItemResDto> deviceUsage = mapUsageRows(
+                        sessionRepo.aggregateDeviceUsageForActiveUsers(tenantId, startDateTime, endDateTime, activeSince, now));
+                List<DeviceUsageItemResDto> platformUsage = mapUsageRows(
+                        sessionRepo.aggregatePlatformUsageForActiveUsers(tenantId, startDateTime, endDateTime, activeSince, now));
+                return new DevicePlatformUsageResDTO(tenantId, deviceUsage, platformUsage);
+            } catch (Exception ex) {
+                log.warn("Active-user device/platform query failed for tenant {}. Falling back to basic aggregate query. cause={}",
+                        tenantId, ex.getMessage());
+                List<DeviceUsageItemResDto> deviceUsage = mapUsageRows(
+                        sessionRepo.aggregateDeviceUsageBasic(tenantId, startDateTime, endDateTime));
+                List<DeviceUsageItemResDto> platformUsage = mapUsageRows(
+                        sessionRepo.aggregatePlatformUsageBasic(tenantId, startDateTime, endDateTime));
+                return new DevicePlatformUsageResDTO(tenantId, deviceUsage, platformUsage);
+            }
+        });
+    }
+
+    public List<DauResDTO> getDailyActiveUsers(Long tenantId, Instant start, Instant end) {
+        if (tenantId == null || start == null || end == null || end.isBefore(start)) {
+            return List.of();
+        }
+
+        // Keep DAU endpoint DB-first and cache-free for faster, stable response even when Redis is unavailable.
+        return getDailyEngagementByDateRangeInternal(tenantId, start, end, false).stream()
+                .map(day -> new DauResDTO(
+                        day.getYear(),
+                        day.getMonth(),
+                        day.getDay(),
+                        defaultLong(day.getDistinctUsers())))
+                .toList();
     }
 
     private void ensureMediaData(MediaWatchSessionDTO dto, String title) {
@@ -429,7 +508,7 @@ public class MediaWatchSessionService {
     public List<DailyWatchTimeResDTO> getTotalWatchTimeByDateRange(Long tenantId, Instant start, Instant end) {
         String key = buildMediaStatsKey("dailyWT", tenantId, start, end);
         return getOrCacheMediaStatsList(key, () -> {
-            return getDailyEngagementByDateRangeInternal(tenantId, start, end).stream()
+            return getDailyEngagementByDateRangeInternal(tenantId, start, end, true).stream()
                     .map(day -> new DailyWatchTimeResDTO(
                             day.getYear(),
                             day.getMonth(),
@@ -442,7 +521,7 @@ public class MediaWatchSessionService {
     public List<DailyUniqueUsersResDTO> getUniqueUserCountByDateRange(Long tenantId, Instant start, Instant end) {
         String key = buildMediaStatsKey("uniqueUsers", tenantId, start, end);
         return getOrCacheMediaStatsList(key, () -> {
-            return getDailyEngagementByDateRangeInternal(tenantId, start, end).stream()
+            return getDailyEngagementByDateRangeInternal(tenantId, start, end, true).stream()
                     .map(day -> new DailyUniqueUsersResDTO(
                             day.getYear(),
                             day.getMonth(),
@@ -454,10 +533,11 @@ public class MediaWatchSessionService {
 
     public List<DailyEngagementResDTO> getDailyEngagementByDateRange(Long tenantId, Instant start, Instant end) {
         String key = buildMediaStatsKey("dailyEngagement", tenantId, start, end);
-        return getOrCacheMediaStatsList(key, () -> getDailyEngagementByDateRangeInternal(tenantId, start, end));
+        return getOrCacheMediaStatsList(key, () -> getDailyEngagementByDateRangeInternal(tenantId, start, end, true));
     }
 
-    private List<DailyEngagementResDTO> getDailyEngagementByDateRangeInternal(Long tenantId, Instant start, Instant end) {
+    private List<DailyEngagementResDTO> getDailyEngagementByDateRangeInternal(Long tenantId, Instant start, Instant end,
+            boolean includePendingSessions) {
             OffsetDateTime startDateTime = toOffsetDateTime(start);
             OffsetDateTime endDateTime = toOffsetDateTime(end);
 
@@ -477,9 +557,11 @@ public class MediaWatchSessionService {
                 accumulator.distinctUsers.add(projection.getUserId());
             }
 
-            List<MediaWatchSession> cachedSessions = getCachedSessions(s -> s.getTenantId().equals(tenantId)
-                    && !s.getWatchedAt().isBefore(startDateTime)
-                    && !s.getWatchedAt().isAfter(endDateTime));
+            List<MediaWatchSession> cachedSessions = includePendingSessions
+                    ? getCachedSessions(s -> s.getTenantId().equals(tenantId)
+                            && !s.getWatchedAt().isBefore(startDateTime)
+                            && !s.getWatchedAt().isAfter(endDateTime))
+                    : Collections.emptyList();
 
             for (MediaWatchSession s : cachedSessions) {
                 LocalDate d = toSriLankaLocalDateTime(s.getWatchedAt()).toLocalDate();
@@ -504,6 +586,34 @@ public class MediaWatchSessionService {
 
     private long defaultLong(Long value) {
         return value == null ? 0L : value;
+    }
+
+    private List<PeakUsageHourResDTO> mapPeakUsageRows(List<MediaWatchSessionRepository.PeakUsageHourRow> rows) {
+        if (rows == null || rows.isEmpty()) {
+            return List.of();
+        }
+
+        return rows.stream()
+                .map(row -> new PeakUsageHourResDTO(
+                        row.getHourValue() == null ? 0 : row.getHourValue(),
+                        defaultLong(row.getActiveUsers()),
+                        defaultLong(row.getTotalWatchTime()),
+                        defaultLong(row.getSessionCount())))
+                .toList();
+    }
+
+    private List<DeviceUsageItemResDto> mapUsageRows(List<MediaWatchSessionRepository.UsageAggregateRow> rows) {
+        if (rows == null || rows.isEmpty()) {
+            return List.of();
+        }
+
+        return rows.stream()
+                .map(row -> new DeviceUsageItemResDto(
+                        StringUtils.hasText(row.getGroupLabel()) ? row.getGroupLabel() : "UNKNOWN",
+                        defaultLong(row.getActiveUsers()),
+                        defaultLong(row.getTotalWatchTime()),
+                        defaultLong(row.getSessionCount())))
+                .toList();
     }
 
     private static class DailyAccumulator {
@@ -703,7 +813,7 @@ public class MediaWatchSessionService {
         for (String processingKey : processingKeys) {
             List<MediaWatchSession> pending = readAllSessionsFromSortedSet(processingKey);
             if (pending.isEmpty()) {
-                redisTemplate.delete(processingKey);
+                withRedisWrite("delete-processing-buffer", () -> redisTemplate.delete(processingKey));
                 continue;
             }
 
@@ -712,7 +822,7 @@ public class MediaWatchSessionService {
                 sessionRepo.saveAll(pending.subList(start, end));
             }
             flushAggregatedSummaries(pending);
-            redisTemplate.delete(processingKey);
+            withRedisWrite("delete-processing-buffer", () -> redisTemplate.delete(processingKey));
         }
     }
 
@@ -956,22 +1066,49 @@ public class MediaWatchSessionService {
 
     public void clearTopMediaCache() {
         evictAllMediaStats();
-        Set<String> keys = redisTemplate.keys("topDaily:*");
+        Set<String> keys = withRedisRead("read-topDaily-keys", () -> redisTemplate.keys("topDaily:*"), Collections.emptySet());
         if (keys != null && !keys.isEmpty()) {
-            redisTemplate.delete(keys);
+            withRedisWrite("delete-topDaily-keys", () -> redisTemplate.delete(keys));
         }
     }
 
     private void evictAllMediaStats() {
+        if (shouldSkipRedis()) {
+            return;
+        }
+
         Cache cache = cacheManager.getCache("mediaStats");
         if (cache != null) {
-            cache.clear();
+            try {
+                cache.clear();
+            } catch (RuntimeException ex) {
+                if (isRedisConnectionFailure(ex)) {
+                    markRedisUnavailable("clear-mediaStats-cache", ex);
+                    return;
+                }
+                throw ex;
+            }
         }
     }
 
     private <T> T getCachedMediaStats(String key, Class<T> type) {
+        if (shouldSkipRedis()) {
+            return null;
+        }
+
         Cache cache = cacheManager.getCache("mediaStats");
-        return cache != null ? cache.get(key, type) : null;
+        if (cache == null) {
+            return null;
+        }
+        try {
+            return cache.get(key, type);
+        } catch (RuntimeException ex) {
+            if (isRedisConnectionFailure(ex)) {
+                markRedisUnavailable("get-mediaStats-cache", ex);
+                return null;
+            }
+            throw ex;
+        }
     }
 
     private <T> T getOrCacheMediaStats(String key, Class<T> type, Supplier<T> loader) {
@@ -985,9 +1122,21 @@ public class MediaWatchSessionService {
     }
 
     private <T> List<T> getOrCacheMediaStatsList(String key, Supplier<List<T>> loader) {
-        Cache cache = cacheManager.getCache("mediaStats");
-        @SuppressWarnings("unchecked")
-        List<T> cached = cache != null ? (List<T>) cache.get(key, Object.class) : null;
+        Cache cache = shouldSkipRedis() ? null : cacheManager.getCache("mediaStats");
+        List<T> cached = null;
+        if (cache != null) {
+            try {
+                @SuppressWarnings("unchecked")
+                List<T> cacheValue = (List<T>) cache.get(key, Object.class);
+                cached = cacheValue;
+            } catch (RuntimeException ex) {
+                if (isRedisConnectionFailure(ex)) {
+                    markRedisUnavailable("get-mediaStats-list-cache", ex);
+                } else {
+                    throw ex;
+                }
+            }
+        }
         if (cached != null) {
             return cached;
         }
@@ -998,21 +1147,40 @@ public class MediaWatchSessionService {
 
     private List<TopWatchedMediaResDTO> getOrCacheDailyTopStats(String key,
             Supplier<List<TopWatchedMediaResDTO>> loader) {
-        Cache cache = cacheManager.getCache("mediaStats");
-        @SuppressWarnings("unchecked")
-        List<TopWatchedMediaResDTO> cached = cache != null
-                ? (List<TopWatchedMediaResDTO>) cache.get(key, Object.class)
-                : null;
+        Cache cache = shouldSkipRedis() ? null : cacheManager.getCache("mediaStats");
+        List<TopWatchedMediaResDTO> cached = null;
+        if (cache != null) {
+            try {
+                @SuppressWarnings("unchecked")
+                List<TopWatchedMediaResDTO> cacheValue = (List<TopWatchedMediaResDTO>) cache.get(key, Object.class);
+                cached = cacheValue;
+            } catch (RuntimeException ex) {
+                if (isRedisConnectionFailure(ex)) {
+                    markRedisUnavailable("get-daily-top-spring-cache", ex);
+                } else {
+                    throw ex;
+                }
+            }
+        }
         if (cached != null) {
             log.info("Top watched cache hit: source=spring-cache, key={}, resultCount={}", key, cached.size());
             return cached;
         }
 
-        List<TopWatchedMediaResDTO> cachedRedis = convertCachedTopList(redisTemplate.opsForValue().get(key));
+        List<TopWatchedMediaResDTO> cachedRedis = convertCachedTopList(
+                withRedisRead("get-daily-top-redis-cache", () -> redisTemplate.opsForValue().get(key), null));
         if (cachedRedis != null) {
             log.info("Top watched cache hit: source=redis, key={}, resultCount={}", key, cachedRedis.size());
             if (cache != null) {
-                cache.put(key, cachedRedis);
+                try {
+                    cache.put(key, cachedRedis);
+                } catch (RuntimeException ex) {
+                    if (isRedisConnectionFailure(ex)) {
+                        markRedisUnavailable("put-daily-top-spring-cache", ex);
+                    } else {
+                        throw ex;
+                    }
+                }
             }
             return cachedRedis;
         }
@@ -1020,13 +1188,23 @@ public class MediaWatchSessionService {
         log.info("Top watched cache miss: key={}", key);
         List<TopWatchedMediaResDTO> values = loader.get();
         Duration ttl = dailyTopCacheTtl();
-        if (!ttl.isNegative() && !ttl.isZero()) {
-            redisTemplate.opsForValue().set(key, values, ttl);
-        } else {
-            redisTemplate.opsForValue().set(key, values);
-        }
+        withRedisWrite("set-daily-top-redis-cache", () -> {
+            if (!ttl.isNegative() && !ttl.isZero()) {
+                redisTemplate.opsForValue().set(key, values, ttl);
+            } else {
+                redisTemplate.opsForValue().set(key, values);
+            }
+        });
         if (cache != null) {
-            cache.put(key, values);
+            try {
+                cache.put(key, values);
+            } catch (RuntimeException ex) {
+                if (isRedisConnectionFailure(ex)) {
+                    markRedisUnavailable("put-daily-top-spring-cache", ex);
+                } else {
+                    throw ex;
+                }
+            }
         }
         log.info("Top watched cache populate: key={}, resultCount={}, ttlSeconds={}",
                 key, values.size(), ttl != null ? ttl.getSeconds() : null);
@@ -1034,9 +1212,21 @@ public class MediaWatchSessionService {
     }
 
     private void cacheMediaStatsValue(String key, Object value) {
+        if (shouldSkipRedis()) {
+            return;
+        }
+
         Cache cache = cacheManager.getCache("mediaStats");
         if (cache != null) {
-            cache.put(key, value);
+            try {
+                cache.put(key, value);
+            } catch (RuntimeException ex) {
+                if (isRedisConnectionFailure(ex)) {
+                    markRedisUnavailable("put-mediaStats-cache", ex);
+                    return;
+                }
+                throw ex;
+            }
         }
     }
 
@@ -1061,6 +1251,10 @@ public class MediaWatchSessionService {
     }
 
     private List<MediaWatchSession> readAllPendingSessions() {
+        if (shouldSkipRedis()) {
+            return Collections.emptyList();
+        }
+
         List<MediaWatchSession> sessions = new ArrayList<>();
         for (String key : sessionBufferKeys(PENDING_SESSIONS_ACTIVE_PREFIX + "*")) {
             sessions.addAll(readAllSessionsFromSortedSet(key));
@@ -1077,19 +1271,26 @@ public class MediaWatchSessionService {
             String tenantSuffix = activeKey.substring(PENDING_SESSIONS_ACTIVE_PREFIX.length());
             String processingKey = PENDING_SESSIONS_PROCESSING_PREFIX + tenantSuffix;
 
-            if (Boolean.TRUE.equals(redisTemplate.hasKey(processingKey))) {
+            Boolean hasProcessingKey = withRedisRead(
+                    "check-processing-buffer",
+                    () -> redisTemplate.hasKey(processingKey),
+                    Boolean.FALSE);
+            if (Boolean.TRUE.equals(hasProcessingKey)) {
                 processingKeys.add(processingKey);
                 continue;
             }
 
-            redisTemplate.rename(activeKey, processingKey);
+            withRedisWrite("promote-active-buffer", () -> redisTemplate.rename(activeKey, processingKey));
             processingKeys.add(processingKey);
         }
         return processingKeys;
     }
 
     private List<MediaWatchSession> readAllSessionsFromSortedSet(String key) {
-        Set<Object> raw = redisTemplate.opsForZSet().range(key, 0, -1);
+        Set<Object> raw = withRedisRead(
+                "read-all-sessions-zset",
+                () -> redisTemplate.opsForZSet().range(key, 0, -1),
+                Collections.emptySet());
         if (raw == null || raw.isEmpty()) {
             return Collections.emptyList();
         }
@@ -1104,10 +1305,13 @@ public class MediaWatchSessionService {
     }
 
     private List<MediaWatchSession> readSessionsFromSortedSetByScore(String key, OffsetDateTime start, OffsetDateTime end) {
-        Set<Object> raw = redisTemplate.opsForZSet().rangeByScore(
-                key,
-                start.toInstant().toEpochMilli(),
-                end.toInstant().toEpochMilli());
+        Set<Object> raw = withRedisRead(
+                "read-sessions-zset-by-score",
+                () -> redisTemplate.opsForZSet().rangeByScore(
+                        key,
+                        start.toInstant().toEpochMilli(),
+                        end.toInstant().toEpochMilli()),
+                Collections.emptySet());
         if (raw == null || raw.isEmpty()) {
             return Collections.emptyList();
         }
@@ -1122,8 +1326,62 @@ public class MediaWatchSessionService {
     }
 
     private Set<String> sessionBufferKeys(String pattern) {
-        Set<String> keys = redisTemplate.keys(pattern);
+        Set<String> keys = withRedisRead("read-session-buffer-keys", () -> redisTemplate.keys(pattern), Collections.emptySet());
         return keys == null ? Collections.emptySet() : keys;
+    }
+
+    private boolean shouldSkipRedis() {
+        return Instant.now().isBefore(redisUnavailableUntil);
+    }
+
+    private <T> T withRedisRead(String operation, Supplier<T> supplier, T fallback) {
+        if (shouldSkipRedis()) {
+            return fallback;
+        }
+
+        try {
+            return supplier.get();
+        } catch (RuntimeException ex) {
+            if (isRedisConnectionFailure(ex)) {
+                markRedisUnavailable(operation, ex);
+                return fallback;
+            }
+            throw ex;
+        }
+    }
+
+    private void withRedisWrite(String operation, Runnable action) {
+        if (shouldSkipRedis()) {
+            return;
+        }
+
+        try {
+            action.run();
+        } catch (RuntimeException ex) {
+            if (isRedisConnectionFailure(ex)) {
+                markRedisUnavailable(operation, ex);
+                return;
+            }
+            throw ex;
+        }
+    }
+
+    private boolean isRedisConnectionFailure(Throwable throwable) {
+        Throwable current = throwable;
+        while (current != null) {
+            if (current instanceof RedisConnectionFailureException) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
+    }
+
+    private void markRedisUnavailable(String operation, Throwable throwable) {
+        long cooldownSeconds = Math.max(10L, redisFailOpenCooldownSeconds);
+        redisUnavailableUntil = Instant.now().plusSeconds(cooldownSeconds);
+        log.warn("Redis unavailable during {}. Skipping redis for {}s. Cause={}",
+                operation, cooldownSeconds, throwable.getMessage());
     }
 
     private String activeSessionKey(Long tenantId) {
