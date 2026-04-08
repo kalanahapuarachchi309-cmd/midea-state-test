@@ -1,0 +1,16 @@
+package lk.rumex.rumex_ott_mediaStat.mediaStatistics.dto.res;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class DailyEngagementResDTO {
+    private Integer year;
+    private Integer month;
+    private Integer day;
+    private Long totalWatchTime;
+    private Long distinctUsers;
+}
